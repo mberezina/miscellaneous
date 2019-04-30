@@ -1,0 +1,11 @@
+---- Creating TCGA list of patients for cross-reference
+drop table if exists #tcga;
+create table #tcga as (
+select distinct patient_id
+from clinical_mart_v1_2.vw_patient
+inner join (select patient_hkey as patient_id
+            from src_tcga.tcga_bcr t
+            INNER JOIN vault.patient_gateway_meta_sat pgms
+                   on t.file_id = pgms.partner_patient_id
+             ) b
+using (patient_id));
