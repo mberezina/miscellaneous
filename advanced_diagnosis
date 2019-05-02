@@ -1,0 +1,87 @@
+
+set search_path = clinical_mart_v1_2;
+drop table if exists #advncd_diagnosis;
+create table #advncd_diagnosis as (
+    with m_stage_and_stage as
+             (
+                 select distinct diagnostic_report_id,
+                                 patient_id,
+                                 value_concept_canonical_name
+                 from clinical_mart_v1_2.vw_stage
+                 where vw_stage.rollup_value_name = 'Stage 4'
+                   and vw_stage.patient_id in (select patient_id FROM #qualified_molecular)
+                 union all
+                 select distinct diagnostic_report_id,
+                                 patient_id,
+                                 value_concept_canonical_name
+                 from clinical_mart_v1_2.vw_m_stage
+                 where value_concept_canonical_name in ('M1')
+                   and vw_m_stage.patient_id in (select patient_id FROM #qualified_molecular)
+             ),
+         m_stage_with_date as (
+             with m_stage_and_stage_agg as (
+                 select patient_id,
+                        listagg(value_concept_canonical_name, ',') as stage_names
+                 from m_stage_and_stage
+                 group by patient_id
+             ),
+                  stagedates as (
+                      select a.patient_id, min(c.effective_date_time) as min_date
+                      from m_stage_and_stage a
+                               inner join vw_diagnostic_report_tumor_characterization c using (diagnostic_report_id)
+                      where effective_date_time not in ('')
+                      group by a.patient_id
+                  )
+             select patient_id, stage_names, min_date as stage_date
+             from m_stage_and_stage_agg
+                      left join stagedates using (patient_id)
+         ),
+         metastasis as
+             (select a.patient_id,
+                     a.rollup_site_name,
+                     a.onset_date_time
+              from clinical_mart_v1_2.vw_metastases a
+              where a.patient_id in (select patient_id FROM #qualified_molecular)
+
+--    -- To pull mets only for primary cancer:
+                 --    [Note implementing because only 1.7 % (159/10070) of patients have
+                 --    met to additional cancer rather than primary cancer
+                 --   select  a.patient_id,
+                 --   a.metastasis_concept_canonical_name,
+                 --   a.onset_date_time,
+                 --   b.condition_concept_canonical_name,
+                 --   b.clinical_status
+                 --   from clinical_mart_v1_2.vw_metastases a
+                 --   inner join clinical_mart_v1_2.vw_cancer b on a.origin_cancer_condition_id = b.condition_id
+                 --   where a.patient_id in (select patient_id FROM #qualified_molecular )
+                 --   and b.clinical_status = 'primary'
+             ),
+         mets_with_dates as
+             (with mets as (
+                 select patient_id,
+                        listagg(rollup_site_name, ',') as met_names
+                 from metastasis
+                 group by patient_id
+             ),
+                   metdates as (
+                       select patient_id, min(onset_date_time) as min_date
+                       from metastasis
+                       group by patient_id
+                   )
+              select patient_id, met_names, min_date
+              from mets
+                       left join metdates using (patient_id)
+             )
+--- # Output: List with all metastasis in one column with minimum met date
+-- and/or ALL "stage IV" or "M1" with minimum date for these characteristics
+    select a.patient_id,
+           b.met_names,
+           b.min_date,
+           c.stage_names,
+           c.stage_date
+    from #qualified_molecular a
+             left join mets_with_dates b using (patient_id)
+             left join m_stage_with_date c using (patient_id)
+);
+select *
+from #advncd_diagnosis;
