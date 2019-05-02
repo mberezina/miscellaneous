@@ -1,0 +1,24 @@
+
+select file_type, count(distinct (oa.patient_id))
+from nventory_mart.order_molecular_urls murl
+join nventory_mart.order_all oa on oa.run_id = murl.run_id
+where murl.patient_id in 
+    (select q_uuid from #JTJN_26) --- <--input list of q_uuids or query to pull list here
+and murl.file_type in (
+    'dna_tumor_bam_sorted',
+    'dna_tumor_fastq',
+    'dna_vcf_raw_pindel',
+    'dna_vcf_raw_freebayes',
+    'dna_vcf_somatic_pindel',
+    'dna_vcf_somatic_freebayes',
+    'dna_vcf_germline_pindel',
+    'dna_vcf_germline_freebayes',
+    'dna_normal_bam_sorted',
+    'dna_normal_fastq',
+    'rna_tumor_fastq',
+    'rna_variant_bam_sorted_v2'
+    'rna_fusion_parc_v1',
+    'dna_fusion'
+ )
+and oa.qc_status in ('pass', 'pass_except')
+group by file_type;
