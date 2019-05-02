@@ -1,0 +1,5 @@
+select *
+from clinical_mart_v1_2.vw_medications
+where regexp_instr(lower(medication_concept_name), 'nivolumab|opdivo|pembrolizumab|keytruda' ||
+                                                   '|ipilimumab|yervoy|atezolizumab|tecentriq|' ||
+                                                   'durvalumab|imfinzi|avelumab|bavencio') = 1
