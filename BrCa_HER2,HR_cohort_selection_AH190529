@@ -1,0 +1,198 @@
+-- Amy Hong, May 2019
+-- This script generates a table with candidates for breast cancer cohorts depending on ERBB2, PGR, and ESR1 test results
+
+-- vw_cancer: condition_concept_canonical_code | condition_concept_canonical_name
+-- -> 254837009 | Malignant tumor of breast
+-- -> 372064008 | Malignant neoplasm of female breast
+-- -> 372095001 | Malignant neoplasm of male breast
+-- -> 93884005  | Primary malignant neoplasm of male breast
+
+-- vw_sequencing: observation_concept_canonical_code | observation_concept_canonical_name
+-- -> for HER2, HGNC:3430 | ERBB2
+-- -> for HR, HGNC:8910   | PGR
+-- ->         HGNC:3467   | ESR1
+
+-- vw_sequencing: interpretation_canonical_code | interpretation_canonical_name
+-- -> For positive, 10828004  | Positive
+-- ->               12645001  | Gene amplification
+-- ->               260408008 | Weakly positive
+-- ->               55446002  | Genetic mutation
+-- ->               259976008 | Gene rearrangement
+-- -> For negative, 260385009 | Negative
+-- ->               260415000 | Not detected
+-- ->               412730000 | Negative genetic finding
+
+SET SEARCH_PATH = clinical_mart_v1_2;
+DROP TABLE IF EXISTS #dx_date;
+DROP TABLE IF EXISTS #prot_test;
+DROP TABLE IF EXISTS #date_diff_pass;
+DROP TABLE IF EXISTS #all_tests_pass;
+DROP TABLE IF EXISTS #cohort_candidates;
+CREATE TABLE #dx_date AS ( -- breast cancer primary diagnosis date
+    SELECT DISTINCT q_uuid, patient_id, TO_DATE(onset_date_time,'YYYY-MM-DD') AS diagnosis_date
+    FROM vw_cancer
+    /* ↓ condition codes in the parentheses for breast cancer ↓ */
+    WHERE condition_concept_canonical_code IN ('254837009','372064008','372095001','93884005')
+    /* ↓ insert primary/additional ↓ */
+    AND clinical_status = 'primary'
+    AND LEN(onset_date_time) >= 7 -- at least year/month granularity
+    AND q_uuid IS NOT NULL
+    GROUP BY q_uuid, patient_id, diagnosis_date
+    HAVING diagnosis_date > '1000-01-01'
+);
+CREATE TABLE #prot_test AS ( -- specimen collection date as testing date
+    SELECT q_uuid, patient_id, sequence_id, interpretation_canonical_code, interpretation_canonical_name, observation_concept_canonical_code, observation_concept_canonical_name,
+           CASE -- prioritize specimen_collection_date; if only sequencing_date available, use sequencing_date
+               WHEN LEN(specimen_collection_date) >= 7
+                   THEN to_date(specimen_collection_date, 'YYYY-MM-DD')
+               WHEN (specimen_collection_date IS NULL OR LEN(specimen_collection_date) < 7) AND LEN(sequencing_date) >= 7
+                   THEN to_date(sequencing_date, 'YYYY-MM-DD')
+               WHEN (specimen_collection_date IS NULL OR LEN(specimen_collection_date) < 7) AND (sequencing_date IS NULL OR LEN(sequencing_date) < 7)
+                   THEN '0001-01-01' -- dates less granular than year & month will get excluded by HAVING clause below
+               END AS testing_date
+    FROM vw_sequencing
+    WHERE q_uuid IN (
+        SELECT q_uuid FROM vw_sequencing
+        WHERE interpretation_canonical_code IN ('10828004', '12645001', '260408008', '55446002', '259976008', '260385009', '260415000', '412730000')
+        AND observation_concept_canonical_code IN ('HGNC:3430','HGNC:8910','HGNC:3467')
+        AND q_uuid IN ( -- patient must have at least one of each test (ERBB2, PRG, ESR1), with positive or negative results
+            SELECT q_uuid FROM vw_sequencing
+            WHERE q_uuid  IN (
+                SELECT q_uuid FROM vw_sequencing
+                WHERE q_uuid IN (
+                    SELECT q_uuid FROM vw_sequencing
+                    WHERE interpretation_canonical_code IN ('10828004', '12645001', '260408008', '55446002', '259976008', '260385009', '260415000', '412730000')
+                    AND observation_concept_canonical_code = 'HGNC:3430' -- ERBB2
+                    AND q_uuid IS NOT NULL
+                    )
+                AND interpretation_canonical_code IN ('10828004', '12645001', '260408008', '55446002', '259976008', '260385009', '260415000', '412730000')
+                AND observation_concept_canonical_code = 'HGNC:8910' -- PGR
+                AND method_name != 'Fluorescent in Situ Hybridization'
+                AND q_uuid IS NOT NULL
+                )
+            AND interpretation_canonical_code IN ('10828004', '12645001', '260408008', '55446002', '259976008', '260385009', '260415000', '412730000')
+            AND observation_concept_canonical_code = 'HGNC:3467' -- ESR1
+            AND method_name != 'Fluorescent in Situ Hybridization'
+            AND q_uuid IS NOT NULL
+            )
+        )
+    AND observation_concept_canonical_code IN ('HGNC:3430','HGNC:8910','HGNC:3467') -- HGNC:3430 for ERBB2, HGNC:8910 for PGR, HGNC:3467 for ESR1
+    AND interpretation_canonical_code IN ('10828004','12645001','260408008','55446002','259976008','260385009','260415000','412730000')
+    AND q_uuid IS NOT NULL
+    GROUP BY q_uuid, patient_id, sequence_id, specimen_collection_date, sequencing_date, interpretation_canonical_code, interpretation_canonical_name, observation_concept_canonical_code, observation_concept_canonical_name
+    HAVING testing_date > '1000-01-01'
+    ORDER BY q_uuid ASC
+);
+CREATE TABLE #date_diff_pass AS ( -- those that pass the user-specified bound for time difference between dx & test
+    SELECT #dx_date.q_uuid, #dx_date.patient_id, #dx_date.diagnosis_date, #prot_test.observation_concept_canonical_code, #prot_test.observation_concept_canonical_name, #prot_test.testing_date, DATEDIFF(DAY, diagnosis_date, testing_date) AS date_difference, #prot_test.sequence_id, #prot_test.interpretation_canonical_code, #prot_test.interpretation_canonical_name
+    FROM #dx_date
+    JOIN #prot_test
+    ON #dx_date.q_uuid = #prot_test.q_uuid
+    GROUP BY #dx_date.q_uuid, #dx_date.patient_id, #dx_date.diagnosis_date, #prot_test.observation_concept_canonical_code, #prot_test.observation_concept_canonical_name, #prot_test.testing_date, date_difference, #prot_test.sequence_id, #prot_test.interpretation_canonical_code, #prot_test.interpretation_canonical_name
+    /* ↓ SET BOUND FOR TIME DIFFERENCE (IN DAYS) BETWEEN diagnosis_date & testing_date ↓ */
+    HAVING date_difference BETWEEN -30 AND 60
+    ORDER BY #dx_date.q_uuid, #prot_test.testing_date
+);
+CREATE TABLE #all_tests_pass AS ( -- those with all 3 tests (ERBB2, PGR, ESR1) pass date_diff_pass
+    SELECT * FROM #date_diff_pass
+    WHERE q_uuid IN (
+        SELECT q_uuid
+        FROM #date_diff_pass
+        GROUP BY q_uuid
+        HAVING COUNT(DISTINCT observation_concept_canonical_code) = 3
+        )
+    GROUP BY q_uuid, patient_id, diagnosis_date, observation_concept_canonical_code, observation_concept_canonical_name, testing_date, date_difference, sequence_id, interpretation_canonical_code, interpretation_canonical_name
+    ORDER BY q_uuid ASC
+);
+
+
+/* BELOW BLOCKS ARE FOR THE ACTUAL COHORT SELECTION. THERE ARE 2 CASES TO CHOOSE FROM: CHOOSE ONLY 1 AND COMMENT OUT THE OTHER. */
+/* WITHIN THE CHOSEN CASE, COMMENT OUT UNNECESSARY LINES ACCORDING TO COHORT REQUIREMENTS AND RUN WITH THE ABOVE SCRIPT */
+
+/* CASE 1: IF WANT TO SPECIFY RESULTS OF ALL THREE GENES (ERBB2, PGR, ESR1) SEPARATELY */
+WITH cohort_candidates AS (
+    SELECT * FROM #all_tests_pass
+    /* ↓ condition: patient has to have consistent results over time for all tests on the same gene ↓ */
+    WHERE (
+        q_uuid IN (
+            SELECT DISTINCT q_uuid FROM #all_tests_pass
+            WHERE observation_concept_canonical_code = 'HGNC:3430' -- ERBB2
+            GROUP BY q_uuid
+
+            /* ↓ COMMENT OUT ALL BUT 1 OF 3 LINES BELOW ↓ */
+            HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('260385009','260415000','412730000') THEN 1 END) -- ERBB2-
+            --HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('10828004','12645001','260408008','55446002','259976008') THEN 1 END) -- ERBB2+
+            --HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('10828004','12645001','260408008','55446002','259976008','260385009','260415000','412730000') THEN 1 END) -- ERBB2-/+
+        )
+        AND q_uuid IN (
+            SELECT DISTINCT q_uuid FROM #all_tests_pass
+            WHERE observation_concept_canonical_code = 'HGNC:8910' -- PGR
+            GROUP BY q_uuid
+
+            /* ↓ COMMENT OUT ALL BUT 1 OF 3 LINES BELOW ↓ */
+            HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('260385009','260415000','412730000') THEN 1 END) -- PGR-
+            --HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('10828004','12645001','260408008','55446002','259976008') THEN 1 END) -- PGR+
+            --HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('10828004','12645001','260408008','55446002','259976008','260385009','260415000','412730000') THEN 1 END) -- PGR-/+
+        )
+        AND q_uuid IN (
+            SELECT DISTINCT q_uuid FROM #all_tests_pass
+            WHERE observation_concept_canonical_code = 'HGNC:3467' -- ESR1
+            GROUP BY q_uuid
+
+            /* ↓ COMMENT OUT ALL BUT 1 OF 3 LINES BELOW ↓ */
+            HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('260385009','260415000','412730000') THEN 1 END) -- ESR1-
+            --HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('10828004','12645001','260408008','55446002','259976008') THEN 1 END) -- ESR1+
+            --HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('10828004','12645001','260408008','55446002','259976008','260385009','260415000','412730000') THEN 1 END) -- ESR1-/+
+        )
+    )
+GROUP BY q_uuid, patient_id, diagnosis_date, observation_concept_canonical_code, observation_concept_canonical_name, testing_date, date_difference, sequence_id, interpretation_canonical_code, interpretation_canonical_name
+)
+SELECT * FROM cohort_candidates
+GROUP BY q_uuid, patient_id, diagnosis_date, observation_concept_canonical_code, observation_concept_canonical_name, testing_date, date_difference, sequence_id, interpretation_canonical_code, interpretation_canonical_name
+ORDER BY q_uuid ASC, observation_concept_canonical_code ASC;
+/* END OF CASE 1: IF WANT TO SPECIFY RESULTS OF ALL THREE GENES (ERBB2, PGR, ESR1) SEPARATELY */
+
+/* CASE 2: IF WANT TO SPECIFY RESULTS OF ERBB2 AND HR (PGR OR ESR1) ↓ */
+WITH cohort_candidates AS (
+    SELECT * FROM #all_tests_pass
+    /* ↓ condition: patient has to have consistent results over time for all tests on the same gene ↓ */
+    WHERE (
+        q_uuid IN (
+            SELECT DISTINCT q_uuid FROM #all_tests_pass
+            WHERE observation_concept_canonical_code = 'HGNC:3430' -- ERBB2
+            GROUP BY q_uuid
+
+            /* ↓ COMMENT OUT ALL BUT 1 OF 3 LINES BELOW ↓ */
+            HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('260385009','260415000','412730000') THEN 1 END) -- ERBB2-
+            --HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('10828004','12645001','260408008','55446002','259976008') THEN 1 END) -- ERBB2+
+            --HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('10828004','12645001','260408008','55446002','259976008','260385009','260415000','412730000') THEN 1 END) -- ERBB2-/+
+        )
+        AND (
+            q_uuid IN (
+                SELECT DISTINCT q_uuid FROM #all_tests_pass
+                WHERE observation_concept_canonical_code = 'HGNC:8910' -- PGR
+                GROUP BY q_uuid
+
+                /* ↓ COMMENT OUT ALL BUT 1 OF 3 LINES BELOW ↓ */
+                --HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('260385009','260415000','412730000') THEN 1 END) -- HR-
+                HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('10828004','12645001','260408008','55446002','259976008') THEN 1 END) -- HR+
+                --HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('10828004','12645001','260408008','55446002','259976008','260385009','260415000','412730000') THEN 1 END) -- HR-/+
+            )
+            OR q_uuid IN (
+                SELECT DISTINCT q_uuid FROM #all_tests_pass
+                WHERE observation_concept_canonical_code = 'HGNC:3467' -- ESR1
+                GROUP BY q_uuid
+
+                /* ↓ COMMENT OUT ALL BUT 1 OF 3 LINES BELOW ↓ */
+                --HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('260385009','260415000','412730000') THEN 1 END) -- HR-
+                HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('10828004','12645001','260408008','55446002','259976008') THEN 1 END) -- HR+
+                --HAVING COUNT(interpretation_canonical_code) = COUNT(CASE WHEN interpretation_canonical_code IN ('10828004','12645001','260408008','55446002','259976008','260385009','260415000','412730000') THEN 1 END) -- HR-/+
+            )
+        )
+    )
+GROUP BY q_uuid, patient_id, diagnosis_date, observation_concept_canonical_code, observation_concept_canonical_name, testing_date, date_difference, sequence_id, interpretation_canonical_code, interpretation_canonical_name
+)
+SELECT * FROM cohort_candidates
+GROUP BY q_uuid, patient_id, diagnosis_date, observation_concept_canonical_code, observation_concept_canonical_name, testing_date, date_difference, sequence_id, interpretation_canonical_code, interpretation_canonical_name
+ORDER BY q_uuid ASC, observation_concept_canonical_code ASC;
+/* END OF CASE 2: IF WANT TO SPECIFY RESULTS OF ERBB2 AND HR (PGR OR ESR1) */
